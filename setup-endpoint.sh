@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# setup-endpoint.sh — automate steps 26–33 (install, mount USB, detect NIC, patch files)
+# setup-endpoint.sh — Automate steps 26–33, then run RPort installer (claim-code prompt)
 # Usage:
 #   sudo bash setup-endpoint.sh [--keep-mounted]
 #
-# Re-run safe/idempotent. Logs: /opt/endpoint-setup/logs/
+# Idempotent. Logs to /opt/endpoint-setup/logs/
 
 set -euo pipefail
 
@@ -32,12 +32,12 @@ require_root() {
 pkg_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  # util-linux provides lsblk; fs tools provide rw mounts for common USB formats
-  apt-get install -y ansible sshpass jq util-linux ntfs-3g exfatprogs dosfstools
+  # util-linux -> lsblk; fs tools -> RW for common USB formats
+  apt-get install -y ansible sshpass jq util-linux ntfs-3g exfatprogs dosfstools curl ca-certificates
 }
 
 find_usb_part() {
-  # find a partition on a removable disk
+  # Find a partition living on a removable disk
   lsblk -rpo NAME,TYPE,RM,TRAN,FSTYPE,MOUNTPOINT | awk '
     $2=="disk" && $3==1 {d[$1]=1}
     $2=="part" {parts[NR]=$1}
@@ -54,10 +54,10 @@ ensure_usb_rw_mounted() {
   local mnt="/mnt"
   mkdir -p "$mnt"
 
-  # (Step 27–30) wait for a USB partition
+  # (Steps 27–30) wait up to 60s for USB
   info "Waiting up to 60s for a USB device..."
   local usb_part=""
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     usb_part="$(find_usb_part || true)"
     [ -n "$usb_part" ] && break
     sleep 1
@@ -68,11 +68,11 @@ ensure_usb_rw_mounted() {
   local fstype="$(lsblk -no FSTYPE "$usb_part" || true)"
   info "Filesystem detected: ${fstype:-unknown}"
 
-  # (Re)mount cleanly
+  # Clean mount
   if mountpoint -q "$mnt"; then umount -lf "$mnt" || true; fi
   mount "$usb_part" "$mnt" || true
 
-  # If mounted read-only, try to flip to rw based on fs type
+  # If read-only, try to flip to RW
   if mount | grep -qE " on $mnt .* \(ro,"; then
     info "/mnt is read-only; attempting to switch to read-write..."
     case "$fstype" in
@@ -101,11 +101,11 @@ ensure_usb_rw_mounted() {
 
   ok "Mounted $usb_part at $mnt (read-write)"
   echo "$usb_part" > "$ROOTDIR/usb-partition"
-  echo "$fstype" > "$ROOTDIR/usb-fstype"
+  echo "$fstype"    > "$ROOTDIR/usb-fstype"
 }
 
 detect_nic() {
-  # (Step 32) detect default route interface + IPv4
+  # (Step 32) default route interface + IPv4
   IFACE="$(ip -o -4 route show to default | awk '{print $5; exit}')"
   [ -n "${IFACE:-}" ] || fail "Could not detect default interface."
   IPV4="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4; exit}')"
@@ -123,40 +123,39 @@ backup_file() {
   cp -a "$f" "${f}.bak-$(date -u +%Y%m%d%H%M%S)"
 }
 
-patch_yaml_interface() {
-  # Replace any YAML line like "interface: something" with detected IFACE
-  local file="$1"
+patch_yaml_key() {
+  # Replace YAML key's value on a single line
+  local file="$1" key="$2" value="$3"
   backup_file "$file"
-  sed -E -i "s/^([[:space:]]*interface:[[:space:]]*).*/\1$IFACE/g" "$file"
-}
-
-patch_yaml_parent() {
-  # Replace any YAML line like "parent: something" (macvlan) with detected IFACE
-  local file="$1"
-  backup_file "$file"
-  sed -E -i "s/^([[:space:]]*parent:[[:space:]]*).*/\1$IFACE/g" "$file"
+  # If key exists, replace its value; otherwise append key at end
+  if grep -Eq "^[[:space:]]*$key[[:space:]]*:" "$file"; then
+    sed -E -i "s/^([[:space:]]*$key[[:space:]]*):.*/\1: $value/g" "$file"
+  else
+    echo "$key: $value" >> "$file"
+  fi
 }
 
 patch_files_step33() {
-  # (Step 33) Apply interface to both files on the USB
+  # (Step 33) Update interface value in both files on USB
   local mnt="/mnt"
   local f1="$mnt/Programmer_local.yaml"
   local f2="$mnt/Programmer-files/docker-compose.yml"
 
   if [ -f "$f1" ]; then
-    info "Patching interface in $f1"
-    patch_yaml_interface "$f1"
-    # Also patch any other 'interface:' occurrences inside that file
-    sed -E -i "s/^([[:space:]]*interface:[[:space:]]*).*/\1$IFACE/g" "$f1"
+    info "Patching 'interface' in $f1"
+    patch_yaml_key "$f1" "interface" "$IFACE"
     ok "Updated $f1"
   else
     info "Skip: $f1 not found."
   fi
 
   if [ -f "$f2" ]; then
-    info "Patching parent/interface in $f2"
-    patch_yaml_parent "$f2"
-    sed -E -i "s/^([[:space:]]*interface:[[:space:]]*).*/\1$IFACE/g" "$f2"
+    info "Patching 'parent' and 'interface' in $f2 (macvlan, rules, etc.)"
+    patch_yaml_key "$f2" "parent" "$IFACE"
+    # also replace any plain 'interface:' keys if present
+    if grep -Eq "^[[:space:]]*interface[[:space:]]*:" "$f2"; then
+      sed -E -i "s/^([[:space:]]*interface[[:space:]]*):.*/\1: $IFACE/g" "$f2"
+    fi
     ok "Updated $f2"
   else
     info "Skip: $f2 not found."
@@ -175,6 +174,59 @@ maybe_unmount() {
   fi
 }
 
+run_rport_installer() {
+  echo
+  echo "-----------------------------------------------"
+  echo "RPort pairing"
+  echo "-----------------------------------------------"
+  echo "From your PC, open the RPort console, go to 'More (cog) ▸ Client Access',"
+  echo "add a new access, set the ID to this host (e.g., 'olucust0xx'), then click 'Linux'."
+  echo
+  echo "👉 Option A (recommended): Paste the full Linux command shown there (starts with 'curl https://pairing.rport.io/... rport_installer.sh'):"
+  echo "   - Paste it here and press Enter. I'll run it for you."
+  echo
+  echo "👉 Option B: Press Enter without pasting anything, and I'll run the generic installer that will PROMPT for the claim code."
+  echo
+
+  read -r -p "Paste Linux pairing command (or press Enter to be prompted for claim code): " RPORT_CMD || true
+
+  if [ -n "$RPORT_CMD" ]; then
+    # Extract URL if user pasted entire command; else run as-is
+    if echo "$RPORT_CMD" | grep -qE '^curl[[:space:]]+https?://'; then
+      URL="$(echo "$RPORT_CMD" | grep -Eo 'https?://[^[:space:]]+')"
+      [ -n "$URL" ] || fail "Could not parse URL from the pasted command."
+      info "Downloading installer from: $URL"
+      TMP=/tmp/rport_installer.sh
+      curl -fsSL "$URL" -o "$TMP"
+      chmod +x "$TMP"
+      echo
+      echo "Running RPort installer now..."
+      echo "(If it asks for a claim code, paste the code from the console.)"
+      echo
+      bash "$TMP"
+    else
+      echo
+      echo "Running your pasted command exactly as provided..."
+      echo
+      eval "$RPORT_CMD"
+    fi
+  else
+    # Generic interactive installer — will ask for claim code
+    TMP=/tmp/rport_installer.sh
+    info "Fetching generic RPort installer (will prompt for claim code)..."
+    curl -fsSL https://pairing.rport.io/rport_installer.sh -o "$TMP" || {
+      echo "[!] Could not fetch generic installer. If your org uses a custom pairing URL, rerun the script and paste the full command from the console."
+      return 1
+    }
+    chmod +x "$TMP"
+    echo
+    echo "Running RPort installer now..."
+    echo "(You will be prompted for the claim code.)"
+    echo
+    bash "$TMP"
+  fi
+}
+
 # --- Main flow ---
 require_root
 pkg_install
@@ -182,6 +234,7 @@ ensure_usb_rw_mounted
 detect_nic
 patch_files_step33
 maybe_unmount
+run_rport_installer
 
 echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) setup-endpoint finished ==="
 echo "Log saved to: $LOG"
