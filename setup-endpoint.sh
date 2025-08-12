@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Automates Steps 26–33 from your doc, with optional RPort claim prompt.
+# Automates Steps 26–33 + run Ansible play + tail docker logs
 
 set -euo pipefail
 
-KEEP_MOUNTED="${1:-}"       # Pass --keep-mounted to leave USB mounted
-PRE_CLAIM_ONLY="${2:-}"     # Pass --pre-claim to stop before claim prompt
+KEEP_MOUNTED="${1:-}"              # optional: --keep-mounted (ignored once we start docker logs)
+ANSIBLE_USER="${ANSIBLE_USER:-spectre}"
 
 ROOTDIR="/opt/endpoint-setup"
 LOGDIR="$ROOTDIR/logs"
@@ -16,11 +16,7 @@ info(){ echo "[*] $*"; }
 ok(){ echo "[+] $*"; }
 fail(){ echo "[!] $*" >&2; exit 1; }
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    fail "Please run as root."
-  fi
-}
+require_root() { [ "$(id -u)" -eq 0 ] || fail "Please run as root (sudo)."; }
 
 pkg_install() {
   export DEBIAN_FRONTEND=noninteractive
@@ -44,7 +40,6 @@ find_usb_part() {
 ensure_usb_rw_mounted() {
   local mnt="/mnt"
   mkdir -p "$mnt"
-
   info "Waiting up to 60s for a USB device..."
   local usb_part=""
   for i in $(seq 1 60); do
@@ -58,11 +53,11 @@ ensure_usb_rw_mounted() {
   local fstype="$(lsblk -no FSTYPE "$usb_part" || true)"
   info "Filesystem: ${fstype:-unknown}"
 
-  if mountpoint -q "$mnt"; then umount -lf "$mnt" || true; fi
+  mountpoint -q "$mnt" && umount -lf "$mnt" || true
   mount "$usb_part" "$mnt" || true
 
   if mount | grep -qE " on $mnt .* \(ro,"; then
-    info "Remounting read-write..."
+    info "Remounting read‑write..."
     case "$fstype" in
       ntfs)
         ntfsfix -d "$usb_part" || true
@@ -85,7 +80,7 @@ ensure_usb_rw_mounted() {
     esac
   fi
 
-  mount | grep -qE " on $mnt .* \(rw," || fail "USB still read-only."
+  mount | grep -qE " on $mnt .* \(rw," || fail "USB still read‑only."
   ok "Mounted at $mnt (rw)"
 }
 
@@ -96,11 +91,7 @@ detect_nic() {
   ok "Interface: $IFACE   IPv4: $IPV4"
 }
 
-backup_file() {
-  local f="$1"
-  [ -f "$f" ] || fail "File not found: $f"
-  cp -a "$f" "${f}.bak-$(date -u +%Y%m%d%H%M%S)"
-}
+backup_file() { local f="$1"; [ -f "$f" ] || fail "File not found: $f"; cp -a "$f" "${f}.bak-$(date -u +%Y%m%d%H%M%S)"; }
 
 patch_step33() {
   local mnt="/mnt"
@@ -127,39 +118,42 @@ patch_step33() {
   fi
 }
 
-maybe_unmount() {
-  if [ "$KEEP_MOUNTED" = "--keep-mounted" ]; then
-    info "Keeping /mnt mounted"
-  else
-    umount -lf /mnt || true
-    ok "Unmounted /mnt"
+run_ansible_play() {
+  local play="/mnt/Programmer_local.yaml"
+  [ -f "$play" ] || fail "Playbook not found at $play"
+  echo
+  echo "=== Running Ansible playbook (you will be prompted for become password) ==="
+  echo "Command: ansible-playbook --ask-become-pass --connection=local -u $ANSIBLE_USER $play"
+  echo
+  # If you also want SSH password prompt, add: --ask-pass
+  (cd / && ansible-playbook --ask-become-pass --connection=local -u "$ANSIBLE_USER" "$play")
+  ok "Ansible playbook finished."
+}
+
+unmount_usb() {
+  umount -lf /mnt || true
+  ok "Unmounted /mnt"
+}
+
+tail_docker_logs() {
+  echo
+  echo "=== Tailing Docker logs for project 'greenbone-community-edition' ==="
+  echo "Tip: Press Ctrl+C to stop following logs."
+  echo
+  # If compose isn’t installed/containers not running, show a helpful message
+  if ! command -v docker >/dev/null; then
+    fail "Docker is not installed."
   fi
+  # This does not rely on files on the USB (project should be already deployed by Ansible).
+  exec docker compose -p greenbone-community-edition logs -f
 }
 
-prompt_claim_code() {
-  local profile_script="/etc/profile.d/99-rport-claim.sh"
-  cat >"$profile_script" <<'EOS'
-#!/usr/bin/env bash
-echo ""
-echo "=== RPort pairing (claim code) ==="
-echo "Option A: Paste the full Linux command from the RPort portal (starts with curl)"
-echo "Option B: Type: curl https://pairing.url | bash"
-EOS
-  chmod +x "$profile_script"
-  ok "Claim code prompt will appear at next login"
-}
-
-# --- Main ---
+# --- main ---
 require_root
 pkg_install
 ensure_usb_rw_mounted
 detect_nic
 patch_step33
-maybe_unmount
-
-if [ "$PRE_CLAIM_ONLY" = "--pre-claim" ]; then
-  touch "$ROOTDIR/.claim_pending"
-  prompt_claim_code
-fi
-
-ok "Automation complete."
+run_ansible_play
+unmount_usb
+tail_docker_logs
