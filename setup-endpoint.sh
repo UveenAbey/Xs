@@ -1,168 +1,151 @@
+cat >/opt/endpoint-setup/setup-endpoint.sh <<'EOF'
 #!/usr/bin/env bash
-# setup-endpoint.sh
-# Automates Steps 26–32:
-#  - Installs ansible + sshpass + jq
-#  - Waits for a USB stick, mounts it at /mnt
-#  - Detects default NIC + IPv4
-#  - Patches Programmer_local.yaml (interface:) and docker-compose.yml (parent:) on the USB (depth<=3)
-#  - Writes /opt/endpoint-setup/detected.json
-#  - Unmounts the USB
-#  - Installs a systemd oneshot service so you can re-run easily
-#
-# Usage: sudo ./setup-endpoint.sh
+# setup-endpoint.sh — automate steps 26–33 (no claim code)
+# Usage: sudo bash /opt/endpoint-setup/setup-endpoint.sh [--keep-mounted]
 set -euo pipefail
 
-require_root() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    echo "Run as root (e.g., sudo ./setup-endpoint.sh)"; exit 1
-  fi
-}
-require_root
+KEEP_MOUNTED="${1:-}"
+LOGDIR=/opt/endpoint-setup/logs
+mkdir -p "$LOGDIR"
+LOG="$LOGDIR/setup-endpoint.$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "=== $(date -Is) setup-endpoint start ==="
+
+# ---- Step 26: install packages ----
 export DEBIAN_FRONTEND=noninteractive
-
-echo "[*] Installing prerequisites (ansible, sshpass, jq)…"
 apt-get update -y
-apt-get install -y ansible sshpass jq
+apt-get install -y ansible sshpass jq lsblk
 
-# Workspace and logs
-mkdir -p /opt/endpoint-setup/logs
+# ---- Helpers ----
+fail(){ echo "[!] $*" ; exit 1; }
 
-# --------------------------------------------------------------------
-# Oneshoot payload that does the actual Steps 26–32 work
-# --------------------------------------------------------------------
-cat >/opt/endpoint-setup/endpoint-26-32.sh <<'PAYLOAD'
-#!/usr/bin/env bash
-set -euo pipefail
-
-STAMP=/opt/endpoint-setup/.26-32.completed
-LOG=/opt/endpoint-setup/logs/26-32.log
-exec >>"$LOG" 2>&1
-echo "=== $(date -Is) steps 26-32 start ==="
-
-if [[ -f "$STAMP" ]]; then
-  echo "Already completed once; delete $STAMP to re-run."
-  exit 0
-fi
-
-# --- USB detection (prefer removable disk partitions with filesystems) ---
-find_usb_part() {
+detect_usb_part() {
+  # return first partition belonging to a removable disk that has a filesystem
   lsblk -rpo NAME,TYPE,RM,FSTYPE | awk '
-    $2=="disk" && $3==1 {rem[$1]=1}
-    $2=="part" && $4!="" {
-      p=$1
-      parent=p
-      sub(/p?[0-9]+$/,"",parent)
-      if (rem[parent]==1) { print p }
-    }' | head -n1
+    $2=="disk" && $3==1 {rd[$1]=1}
+    $2=="part" && $4!="" {print $1}
+  ' | while read -r part; do
+      p="$part"; parent="$p"; parent="${parent%[0-9]}"; parent="${parent%p}"
+      if lsblk -rpo NAME,RM | awk -v P="$parent" '$1==P&&$2==1{found=1} END{exit found?0:1}'; then
+        echo "$part"; break
+      fi
+    done
 }
 
-echo "[*] Waiting up to 60s for a USB device…"
+remount_rw_or_fix() {
+  local dev="$1" fstype="$2"
+  if mount | grep -q "/mnt type .* (ro,"; then
+    echo "[i] /mnt currently read-only; trying to make it writable (fstype=$fstype)"
+    case "$fstype" in
+      ntfs)
+        apt-get install -y ntfs-3g
+        ntfsfix -d "$dev" || true
+        mount -o remount,rw "$dev" /mnt || { umount -lf /mnt || true; mount -t ntfs-3g -o rw "$dev" /mnt; }
+        ;;
+      exfat)
+        apt-get install -y exfatprogs
+        fsck.exfat -a "$dev" || true
+        mount -o remount,rw "$dev" /mnt || { umount -lf /mnt || true; mount -t exfat -o rw "$dev" /mnt; }
+        ;;
+      vfat|fat|msdos)
+        apt-get install -y dosfstools
+        dosfsck -a "$dev" || true
+        mount -o remount,rw "$dev" /mnt || { umount -lf /mnt || true; mount -t vfat -o rw,uid=0,gid=0,umask=022 "$dev" /mnt; }
+        ;;
+      ext2|ext3|ext4|"")
+        mount -o remount,rw "$dev" /mnt || true
+        ;;
+      *)
+        mount -o remount,rw "$dev" /mnt || true
+        ;;
+    esac
+  fi
+  mount | grep -q "/mnt type .* (ro," && fail "USB still read-only; cannot patch files"
+}
+
+ts() { date +%Y%m%d%H%M%S; }
+
+backup_file() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -a "$f" "${f}.bak-$(ts)"
+  echo "[+] Backup: ${f}.bak-$(ts)"
+}
+
+# ---- Step 27–30: wait for USB & mount to /mnt ----
+echo "[*] Waiting up to 60s for a USB device..."
 USB_PART=""
-for _ in {1..60}; do
-  USB_PART="$(find_usb_part || true)"
-  [[ -n "${USB_PART:-}" ]] && break
+for i in $(seq 1 60); do
+  USB_PART="$(detect_usb_part || true)"
+  [ -n "$USB_PART" ] && break
   sleep 1
 done
-if [[ -z "${USB_PART:-}" ]]; then
-  echo "[!] No USB detected. Insert USB and re-run: systemctl start endpoint-26-32.service"
-  exit 1
-fi
-echo "[+] USB partition: $USB_PART"
+[ -z "$USB_PART" ] && fail "No USB partition detected. Insert USB and rerun."
 
-# --- Mount USB at /mnt (ro if possible) ---
 mkdir -p /mnt
-if mountpoint -q /mnt; then umount -q /mnt || true; fi
-if ! mount -o ro "$USB_PART" /mnt 2>/dev/null; then
-  mount "$USB_PART" /mnt
-fi
-echo "[+] Mounted at /mnt"
+FSTYPE="$(lsblk -no FSTYPE "$USB_PART" || true)"
+echo "[+] USB partition: $USB_PART  fstype: ${FSTYPE:-unknown}"
 
-# --- Detect default interface & IPv4 ---
+# clean mountpoint if already mounted
+mountpoint -q /mnt && umount -lf /mnt || true
+mount "$USB_PART" /mnt || true
+# if it mounted read-only, try to flip to rw
+remount_rw_or_fix "$USB_PART" "${FSTYPE:-}"
+
+echo "[+] Mounted at /mnt (rw)"
+
+# ---- Step 32: detect NIC + IPv4 ----
 IFACE="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+[ -n "$IFACE" ] || fail "Could not detect default route interface"
 IPV4="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4; exit}')"
-echo "[+] Interface: $IFACE   IPv4: $IPV4"
+echo "[+] Detected interface: $IFACE   IPv4: ${IPV4:-unknown}"
 
-# --- Patch files on USB (depth <= 3) ---
-ts="$(date +%Y%m%d%H%M%S)"
-
-find_target() { find /mnt -maxdepth 3 -type f -iname "$1" | head -n1; }
-
-PROG_FILE="$(find_target Programmer_local.yaml || true)"
-DOCKER_FILE="$(find_target docker-compose.yml || true)"
-
-if [[ -n "${PROG_FILE:-}" && -f "$PROG_FILE" ]]; then
-  cp -a "$PROG_FILE" "${PROG_FILE}.bak-${ts}"
-  # Replace any "interface:" line (preserve indentation)
-  sed -E -i "s/^([[:space:]]*interface:[[:space:]]*).*/\1$IFACE/g" "$PROG_FILE"
-  echo "[+] Patched interface in: $PROG_FILE (backup: ${PROG_FILE}.bak-${ts})"
-else
-  echo "[!] Programmer_local.yaml not found within /mnt (depth<=3)"
-fi
-
-if [[ -n "${DOCKER_FILE:-}" && -f "$DOCKER_FILE" ]]; then
-  cp -a "$DOCKER_FILE" "${DOCKER_FILE}.bak-${ts}"
-  # Replace the first "parent:" occurrence only
-  awk -v iface="$IFACE" '
-    BEGIN{changed=0}
-    {
-      if (!changed && $0 ~ /^[[:space:]]*parent:[[:space:]]*/) {
-        sub(/^[[:space:]]*parent:[[:space:]]*.*/, "      parent: " iface)
-        changed=1
-      }
-      print
-    }' "$DOCKER_FILE" > "${DOCKER_FILE}.tmp" && mv "${DOCKER_FILE}.tmp" "$DOCKER_FILE"
-  echo "[+] Patched parent in: $DOCKER_FILE (backup: ${DOCKER_FILE}.bak-${ts})"
-else
-  echo "[!] docker-compose.yml not found within /mnt (depth<=3)"
-fi
-
-# --- Persist summary ---
+# Save for downstream steps/tools
+mkdir -p /opt/endpoint-setup
 cat >/opt/endpoint-setup/detected.json <<JSON
-{
-  "usb_partition": "$USB_PART",
-  "mountpoint": "/mnt",
-  "interface": "$IFACE",
-  "ipv4": "$IPV4",
-  "programmer_local_path": "${PROG_FILE:-}",
-  "docker_compose_path": "${DOCKER_FILE:-}",
-  "timestamp": "$ts"
-}
+{ "usb_partition":"$USB_PART", "mountpoint":"/mnt", "interface":"$IFACE", "ipv4":"$IPV4" }
 JSON
 echo "[+] Wrote /opt/endpoint-setup/detected.json"
 
-# --- Unmount USB (end of Step 32) ---
-umount /mnt || { echo "[!] Failed to unmount /mnt (files may be open)"; exit 1; }
-echo "[+] USB unmounted (/mnt)"
+# ---- Step 33: patch files on USB with detected interface ----
+PL="/mnt/Programmer_local.yaml"
+DC="/mnt/Programmer-files/docker-compose.yml"
 
-touch "$STAMP"
-echo "=== $(date -Is) steps 26-32 end ==="
-PAYLOAD
-chmod +x /opt/endpoint-setup/endpoint-26-32.sh
+if [ -f "$PL" ]; then
+  echo "[*] Patching $PL"
+  backup_file "$PL"
+  # Replace any "interface: <value>" with detected IFACE
+  sed -E -i "s/^([[:space:]]*interface:[[:space:]]*).*/\1$IFACE/g" "$PL"
+  # Also try YAML lists where interface might appear as a value in rules (best effort)
+  sed -E -i "s/(interface:[[:space:]]*)([a-zA-Z0-9._:-]+)/\1$IFACE/g" "$PL"
+  echo "[+] Updated interface in Programmer_local.yaml -> $IFACE"
+else
+  echo "[i] Skipped: $PL not found"
+fi
 
-# --------------------------------------------------------------------
-# systemd oneshot so you can re-run: systemctl start endpoint-26-32.service
-# --------------------------------------------------------------------
-cat >/etc/systemd/system/endpoint-26-32.service <<'UNIT'
-[Unit]
-Description=Automate Steps 26-32 (install, mount USB, patch files, unmount)
-After=network-online.target
-Wants=network-online.target
+if [ -f "$DC" ]; then
+  echo "[*] Patching $DC"
+  backup_file "$DC"
+  # Replace macvlan parent and any interface keys
+  sed -E -i "s/(parent:[[:space:]]*)([a-zA-Z0-9._:-]+)/\1$IFACE/g" "$DC"
+  sed -E -i "s/(interface:[[:space:]]*)([a-zA-Z0-9._:-]+)/\1$IFACE/g" "$DC"
+  echo "[+] Updated docker-compose.yml parent/interface -> $IFACE"
+else
+  echo "[i] Skipped: $DC not found"
+fi
 
-[Service]
-Type=oneshot
-ExecStart=/opt/endpoint-setup/endpoint-26-32.sh
-RemainAfterExit=no
+# ---- Step 32 (finish): unmount unless asked not to ----
+if [ "$KEEP_MOUNTED" = "--keep-mounted" ]; then
+  echo "[i] Leaving /mnt mounted as requested."
+else
+  umount -lf /mnt || true
+  echo "[+] Unmounted /mnt"
+fi
 
-[Install]
-WantedBy=multi-user.target
-UNIT
+echo "=== $(date -Is) setup-endpoint done ==="
+EOF
 
-systemctl daemon-reload
-systemctl enable --now endpoint-26-32.service || true
-
-echo
-echo "==> Installed."
-echo "    Run now (or after inserting USB): sudo systemctl start endpoint-26-32.service"
-echo "    Logs:    /opt/endpoint-setup/logs/26-32.log"
-echo "    Results: /opt/endpoint-setup/detected.json"
-
+chmod +x /opt/endpoint-setup/setup-endpoint.sh
+echo "Saved script to /opt/endpoint-setup/setup-endpoint.sh"
+echo "Run it with: sudo /opt/endpoint-setup/setup-endpoint.sh"
