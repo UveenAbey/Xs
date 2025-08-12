@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-endpoint.sh
-# Automates your Steps 26–32:
+# Automates Steps 26–32:
 #  - Installs ansible + sshpass + jq
 #  - Waits for a USB stick, mounts it at /mnt
 #  - Detects default NIC + IPv4
@@ -165,3 +165,4 @@ echo "==> Installed."
 echo "    Run now (or after inserting USB): sudo systemctl start endpoint-26-32.service"
 echo "    Logs:    /opt/endpoint-setup/logs/26-32.log"
 echo "    Results: /opt/endpoint-setup/detected.json"
+
